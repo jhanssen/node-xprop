@@ -1,6 +1,9 @@
 #include <nan.h>
+#include <node_buffer.h>
 #include <xcb/xcb.h>
 #include <xcb/xcb_icccm.h>
+#include <unordered_map>
+#include <string>
 
 struct Data
 {
@@ -13,6 +16,16 @@ struct Data
     xcb_connection_t* conn;
     int screenCount;
     uv_poll_t poller;
+
+    struct Property
+    {
+        uint8_t mode;
+        xcb_atom_t property, type;
+        uint8_t format;
+        std::string data;
+    };
+    static bool propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop);
+    std::unordered_map<std::string, Property> classProperties, nameProperties;
 
     static void pollCallback(uv_poll_t* handle, int status, int events);
 } data;
@@ -78,16 +91,131 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     }
 }
 
-static void ForWindowClass(const v8::Local<v8::Value>& obj)
+bool Data::propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop)
 {
     Nan::HandleScope scope;
-    data.ensure();
+    auto ctx = Nan::GetCurrentContext();
+
+    auto atom = [](const v8::Local<v8::Value>& val) -> xcb_atom_t {
+        if (val->IsNumber()) {
+            return v8::Local<v8::Int32>::Cast(val)->Value();
+        } else {
+            v8::String::Utf8Value str(val);
+            xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, str.length(), *str);
+            xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
+            xcb_atom_t atom = XCB_ATOM_NONE;
+            if (reply) {
+                atom = reply->atom;
+                free(reply);
+            }
+            return atom;
+        }
+    };
+
+    auto modeStr = Nan::New("mode").ToLocalChecked();
+    auto propertyStr = Nan::New("property").ToLocalChecked();
+    auto typeStr = Nan::New("type").ToLocalChecked();
+    auto formatStr = Nan::New("format").ToLocalChecked();
+    auto dataStr = Nan::New("data").ToLocalChecked();
+
+    // required properties
+    if (!obj->Has(propertyStr) || !obj->Has(dataStr)) {
+        Nan::ThrowError("Needs at least property and data");
+        return false;
+    }
+
+    if (obj->Has(modeStr)) {
+        prop.mode = v8::Local<v8::Number>::Cast(obj->Get(ctx, modeStr).ToLocalChecked())->Value();
+        switch (prop.mode) {
+        case XCB_PROP_MODE_REPLACE:
+        case XCB_PROP_MODE_PREPEND:
+        case XCB_PROP_MODE_APPEND:
+            break;
+        default:
+            Nan::ThrowError("Invalid mode");
+            return false;
+        }
+    } else {
+        prop.mode = XCB_PROP_MODE_REPLACE;
+    }
+    prop.property = atom(obj->Get(ctx, propertyStr).ToLocalChecked());
+    if (obj->Has(typeStr)) {
+        prop.type = atom(obj->Get(ctx, typeStr).ToLocalChecked());
+    } else {
+        prop.type = XCB_ATOM_STRING;
+    }
+    if (obj->Has(formatStr)) {
+        auto val = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
+        switch (val) {
+        case 8:
+        case 16:
+        case 32:
+            break;
+        default:
+            Nan::ThrowError("Invalid format");
+            return false;
+        }
+    } else {
+        prop.format = 8;
+    }
+    auto data = obj->Get(ctx, dataStr).ToLocalChecked();
+    if (node::Buffer::HasInstance(data)) {
+        const size_t len = node::Buffer::Length(data);
+        const char* ptr = node::Buffer::Data(data);
+        prop.data = std::string(ptr, len);
+    } else {
+        // assume Utf8String
+        v8::String::Utf8Value str(data);
+        prop.data = std::string(*str, str.length());
+    }
+    return true;
 }
 
-static void ForWindowName(const v8::Local<v8::Value>& obj)
+static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::Value>& val)
 {
+    if (!cls->IsString()) {
+        Nan::ThrowError("Class needs to be a string");
+        return;
+    }
+    if (!val->IsObject()) {
+        Nan::ThrowError("Data needs to be an object");
+        return;
+    }
     Nan::HandleScope scope;
     data.ensure();
+
+    const std::string clsstr = *v8::String::Utf8Value(cls);
+    v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
+
+    Data::Property prop;
+    if (!Data::propertyFromObject(obj, prop))
+        return;
+    // if we have an existing window, handle that here
+    data.classProperties[clsstr] = std::move(prop);
+}
+
+static void ForWindowName(const v8::Local<v8::Value>& name, const v8::Local<v8::Value>& val)
+{
+    if (!name->IsString()) {
+        Nan::ThrowError("Name needs to be a string");
+        return;
+    }
+    if (!val->IsObject()) {
+        Nan::ThrowError("Data needs to be an object");
+        return;
+    }
+
+    Nan::HandleScope scope;
+    data.ensure();
+
+    const std::string namestr = *v8::String::Utf8Value(name);
+    v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
+
+    Data::Property prop;
+    if (!Data::propertyFromObject(obj, prop))
+        return;
+    // if we have an existing window, handle that here
+    data.nameProperties[namestr] = std::move(prop);
 }
 
 static void ForWindow(const Nan::FunctionCallbackInfo<v8::Value>& args)
@@ -101,12 +229,19 @@ static void ForWindow(const Nan::FunctionCallbackInfo<v8::Value>& args)
 
     auto classStr = Nan::New("class").ToLocalChecked();
     auto nameStr = Nan::New("name").ToLocalChecked();
-    // if we have a class key
-    if ((obj->HasOwnProperty(Nan::GetCurrentContext(), classStr)).ToChecked()) {
-        ForWindowClass(obj->Get(Nan::GetCurrentContext(), classStr).ToLocalChecked());
+    auto dataStr = Nan::New("data").ToLocalChecked();
+    if (!obj->Has(dataStr)) {
+        Nan::ThrowError("Needs a data property");
+        return;
     }
-    if ((obj->HasOwnProperty(Nan::GetCurrentContext(), nameStr)).ToChecked()) {
-        ForWindowName(obj->Get(Nan::GetCurrentContext(), nameStr).ToLocalChecked());
+    // if we have a class key
+    if (obj->Has(classStr)) {
+        ForWindowClass(obj->Get(Nan::GetCurrentContext(), classStr).ToLocalChecked(),
+                       obj->Get(Nan::GetCurrentContext(), dataStr).ToLocalChecked());
+    }
+    if (obj->Has(nameStr)) {
+        ForWindowName(obj->Get(Nan::GetCurrentContext(), nameStr).ToLocalChecked(),
+                      obj->Get(Nan::GetCurrentContext(), dataStr).ToLocalChecked());
     }
 }
 
