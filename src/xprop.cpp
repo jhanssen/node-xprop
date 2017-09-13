@@ -117,8 +117,15 @@ struct Data
         virtual void run(xcb_window_t win) const override;
     };
 
+    struct Pending
+    {
+        xcb_window_t window;
+        std::shared_ptr<Base> base;
+    };
+    std::vector<std::pair<uint32_t, std::vector<Pending> > > pendingProperties;
+
     static bool baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>* base);
-    std::unordered_map<std::vector<std::string>, std::shared_ptr<Base> > classProperties;
+    std::unordered_map<std::vector<std::string>, std::vector<std::shared_ptr<Base> > > classProperties;
 
     static void pollCallback(uv_poll_t* handle, int status, int events);
 } data;
@@ -130,14 +137,19 @@ void Data::Property::run(xcb_window_t win) const
 
 void Data::Mapper::run(xcb_window_t win) const
 {
+    // const auto key = (static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | win;
+    // data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_map_window(data.conn, win);
     xcb_flush(data.conn);
 }
 
 void Data::Unmapper::run(xcb_window_t win) const
 {
+    // const auto key = (static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win;
+    // data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_unmap_window(data.conn, win);
     xcb_flush(data.conn);
+    // printf("unmapped\n");
 }
 
 void Data::Remapper::run(xcb_window_t win) const
@@ -188,7 +200,13 @@ public:
 
 void Changer::change(xcb_window_t win, const std::shared_ptr<Data::Base>& b)
 {
-    b->run(win);
+    if (data.pendingProperties.empty()) {
+        // printf("changing...\n");
+        b->run(win);
+    } else {
+        // printf("postponing change\n");
+        data.pendingProperties.back().second.push_back(Data::Pending{ win, b });
+    }
 }
 
 class Traverser
@@ -232,7 +250,7 @@ void Traverser::run()
     xcb_icccm_get_wm_class_reply_t wmclass;
     for (const auto& cookie : mCookies) {
         if (xcb_icccm_get_wm_class_reply(data.conn, cookie.second, &wmclass, nullptr)) {
-            // printf("matching %s(%u) vs %zu candidates\n", wmclass.class_name, mLevel, mMatches.size());
+             // printf("matching %s(%u) vs %zu candidates\n", wmclass.class_name, mLevel, mMatches.size());
             // check if we match any of the items in the level
             auto begin = mMatches.begin();
             auto it = mMatches.begin();
@@ -246,7 +264,10 @@ void Traverser::run()
                         // printf("matched full thingy\n");
                         auto prop = data.classProperties.find(*it);
                         assert(prop != data.classProperties.end());
-                        changer.change(cookie.first, prop->second);
+                        const auto& vec = prop->second;
+                        for (const auto& base : vec) {
+                            changer.change(cookie.first, base);
+                        }
                     } else {
                         // printf("matched sub, querying children\n");
                         // start the next property run
@@ -347,14 +368,57 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     Data* data = static_cast<Data*>(handle->data);
     xcb_generic_event_t* event;
     while ((event = xcb_poll_for_event(data->conn))) {
-        if ((event->response_type & ~0x80) == XCB_REPARENT_NOTIFY) {
+        const auto eventType = event->response_type & ~0x80;
+        if (eventType == XCB_REPARENT_NOTIFY) {
+            // see if we have any pending changes for our window
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
+
             Traverser traverser;
             traverser.traverse(reparentEvent->parent);
             while (traverser.hasMore()) {
                 traverser.run();
             }
         }
+        /*
+        if (eventType == XCB_MAP_NOTIFY) {
+            // see if we have any pending changes for our window
+            xcb_map_notify_event_t* mapEvent = reinterpret_cast<xcb_map_notify_event_t*>(event);
+            const auto key = (static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | mapEvent->window;
+            auto p = data->pendingProperties.begin();
+            while (p != data->pendingProperties.end()) {
+                if (p->first == key) {
+                    for (const auto& item : p->second) {
+                        item.base->run(item.window);
+                    }
+                    p = data->pendingProperties.erase(p);
+                } else {
+                    ++p;
+                }
+            }
+
+            Traverser traverser;
+            traverser.traverse(mapEvent->window);
+            while (traverser.hasMore()) {
+                traverser.run();
+            }
+        } else if (eventType == XCB_UNMAP_NOTIFY) {
+            // see if we have any pending changes for our window
+            xcb_unmap_notify_event_t* unmapEvent = reinterpret_cast<xcb_unmap_notify_event_t*>(event);
+            const uint64_t key = (static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | unmapEvent->window;
+            auto p = data->pendingProperties.begin();
+            while (p != data->pendingProperties.end()) {
+                if (p->first == key) {
+                    for (const auto& item : p->second) {
+                        item.base->run(item.window);
+                    }
+                    p = data->pendingProperties.erase(p);
+                } else {
+                    ++p;
+                }
+            }
+            }
+        */
+        // printf("got event %d\n", eventType);
         free(event);
     }
 }
@@ -498,7 +562,7 @@ static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::
     if (!Data::baseFromValue(val, &base))
         return;
     // if we have an existing window, handle that here
-    data.classProperties[split(clsstr, '.')] = base;
+    data.classProperties[split(clsstr, '.')].push_back(base);
 
     GrabServer grab(data.conn);
     Traverser traverser;
