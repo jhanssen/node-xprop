@@ -319,8 +319,8 @@ bool Data::propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop)
         prop.type = XCB_ATOM_STRING;
     }
     if (obj->Has(formatStr)) {
-        auto val = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
-        switch (val) {
+        prop.format = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
+        switch (prop.format) {
         case 8:
         case 16:
         case 32:
