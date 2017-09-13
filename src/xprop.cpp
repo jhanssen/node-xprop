@@ -6,6 +6,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <memory>
 #include <assert.h>
 
 template<typename Out>
@@ -60,18 +61,45 @@ struct Data
     int screenCount;
     uv_poll_t poller;
 
-    struct Property
+    struct Base
     {
+        virtual ~Base() { }
+        virtual void run(xcb_window_t win) const = 0;
+    };
+
+    struct Property : public Base
+    {
+        virtual void run(xcb_window_t win) const override;
+
         uint8_t mode;
         xcb_atom_t property, type;
         uint8_t format;
         std::vector<uint8_t> data;
     };
-    static bool propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop);
-    std::unordered_map<std::vector<std::string>, Property> classProperties;
+
+    struct Remapper : public Base
+    {
+        virtual void run(xcb_window_t win) const override;
+    };
+
+    static bool baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>* base);
+    std::unordered_map<std::vector<std::string>, std::shared_ptr<Base> > classProperties;
 
     static void pollCallback(uv_poll_t* handle, int status, int events);
 } data;
+
+void Data::Property::run(xcb_window_t win) const
+{
+    xcb_change_property(::data.conn, mode, win, property, type, format, (data.size() * 8) / format, &data[0]);
+}
+
+void Data::Remapper::run(xcb_window_t win) const
+{
+    xcb_unmap_window(data.conn, win);
+    xcb_flush(data.conn);
+    xcb_map_window(data.conn, win);
+    xcb_flush(data.conn);
+}
 
 class Changer
 {
@@ -79,13 +107,13 @@ public:
     Changer() {}
     ~Changer() {}
 
-    void change(xcb_window_t win, const Data::Property& prop);
+    void change(xcb_window_t win, const std::shared_ptr<Data::Base>& b);
     void finish() { xcb_flush(data.conn); }
 };
 
-void Changer::change(xcb_window_t win, const Data::Property& prop)
+void Changer::change(xcb_window_t win, const std::shared_ptr<Data::Base>& b)
 {
-    xcb_change_property(data.conn, prop.mode, win, prop.property, prop.type, prop.format, (prop.data.size() * 8) / prop.format, &prop.data[0]);
+    b->run(win);
 }
 
 class Traverser
@@ -265,96 +293,116 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     }
 }
 
-bool Data::propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop)
+bool Data::baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>* base)
 {
-    Nan::HandleScope scope;
-    auto ctx = Nan::GetCurrentContext();
+    if (val->IsObject()) {
+        // property?
+        v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
 
-    auto atom = [](const v8::Local<v8::Value>& val) -> xcb_atom_t {
-        if (val->IsNumber()) {
-            return v8::Local<v8::Int32>::Cast(val)->Value();
+        std::shared_ptr<Property> prop = std::make_shared<Property>();
+
+        Nan::HandleScope scope;
+        auto ctx = Nan::GetCurrentContext();
+
+        auto atom = [](const v8::Local<v8::Value>& val) -> xcb_atom_t {
+            if (val->IsNumber()) {
+                return v8::Local<v8::Int32>::Cast(val)->Value();
+            } else {
+                v8::String::Utf8Value str(val);
+                xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, str.length(), *str);
+                xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
+                xcb_atom_t atom = XCB_ATOM_NONE;
+                if (reply) {
+                    atom = reply->atom;
+                    free(reply);
+                }
+                return atom;
+            }
+        };
+
+        auto modeStr = Nan::New("mode").ToLocalChecked();
+        auto propertyStr = Nan::New("property").ToLocalChecked();
+        auto typeStr = Nan::New("type").ToLocalChecked();
+        auto formatStr = Nan::New("format").ToLocalChecked();
+        auto dataStr = Nan::New("data").ToLocalChecked();
+
+        // required properties
+        if (!obj->Has(propertyStr) || !obj->Has(dataStr)) {
+            Nan::ThrowError("Needs at least property and data");
+            return false;
+        }
+
+        if (obj->Has(modeStr)) {
+            prop->mode = v8::Local<v8::Number>::Cast(obj->Get(ctx, modeStr).ToLocalChecked())->Value();
+            switch (prop->mode) {
+            case XCB_PROP_MODE_REPLACE:
+            case XCB_PROP_MODE_PREPEND:
+            case XCB_PROP_MODE_APPEND:
+                break;
+            default:
+                Nan::ThrowError("Invalid mode");
+                return false;
+            }
         } else {
-            v8::String::Utf8Value str(val);
-            xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, str.length(), *str);
+            prop->mode = XCB_PROP_MODE_REPLACE;
+        }
+        prop->property = atom(obj->Get(ctx, propertyStr).ToLocalChecked());
+        if (obj->Has(typeStr)) {
+            prop->type = atom(obj->Get(ctx, typeStr).ToLocalChecked());
+        } else {
+            prop->type = XCB_ATOM_STRING;
+        }
+        if (obj->Has(formatStr)) {
+            prop->format = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
+            switch (prop->format) {
+            case 8:
+            case 16:
+            case 32:
+                break;
+            default:
+                Nan::ThrowError("Invalid format");
+                return false;
+            }
+        } else {
+            prop->format = 8;
+        }
+        auto dataval = obj->Get(ctx, dataStr).ToLocalChecked();
+        if (node::Buffer::HasInstance(dataval)) {
+            const size_t len = node::Buffer::Length(dataval);
+            const char* ptr = node::Buffer::Data(dataval);
+            prop->data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
+        } else {
+            // assume Utf8String
+            v8::String::Utf8Value str(dataval);
+            prop->data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
+        }
+        // if type is ATOM then try to internalize the data string
+        if (prop->type == XCB_ATOM_ATOM) {
+            xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, prop->data.size(), reinterpret_cast<char*>(&prop->data[0]));
             xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
             xcb_atom_t atom = XCB_ATOM_NONE;
             if (reply) {
                 atom = reply->atom;
                 free(reply);
             }
-            return atom;
+            prop->data.resize(sizeof(xcb_atom_t));
+            memcpy(&prop->data[0], &atom, sizeof(xcb_atom_t));
         }
-    };
-
-    auto modeStr = Nan::New("mode").ToLocalChecked();
-    auto propertyStr = Nan::New("property").ToLocalChecked();
-    auto typeStr = Nan::New("type").ToLocalChecked();
-    auto formatStr = Nan::New("format").ToLocalChecked();
-    auto dataStr = Nan::New("data").ToLocalChecked();
-
-    // required properties
-    if (!obj->Has(propertyStr) || !obj->Has(dataStr)) {
-        Nan::ThrowError("Needs at least property and data");
+        *base = prop;
+        return true;
+    } else if (val->IsString()) {
+        // runner
+        v8::String::Utf8Value str(val);
+        if (!strncmp(*str, "remap", str.length())) {
+            *base = std::make_shared<Remapper>();
+            return true;
+        }
+        Nan::ThrowError("Unknown data type");
+        return false;
+    } else {
+        Nan::ThrowError("Data needs to be an object or string");
         return false;
     }
-
-    if (obj->Has(modeStr)) {
-        prop.mode = v8::Local<v8::Number>::Cast(obj->Get(ctx, modeStr).ToLocalChecked())->Value();
-        switch (prop.mode) {
-        case XCB_PROP_MODE_REPLACE:
-        case XCB_PROP_MODE_PREPEND:
-        case XCB_PROP_MODE_APPEND:
-            break;
-        default:
-            Nan::ThrowError("Invalid mode");
-            return false;
-        }
-    } else {
-        prop.mode = XCB_PROP_MODE_REPLACE;
-    }
-    prop.property = atom(obj->Get(ctx, propertyStr).ToLocalChecked());
-    if (obj->Has(typeStr)) {
-        prop.type = atom(obj->Get(ctx, typeStr).ToLocalChecked());
-    } else {
-        prop.type = XCB_ATOM_STRING;
-    }
-    if (obj->Has(formatStr)) {
-        prop.format = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
-        switch (prop.format) {
-        case 8:
-        case 16:
-        case 32:
-            break;
-        default:
-            Nan::ThrowError("Invalid format");
-            return false;
-        }
-    } else {
-        prop.format = 8;
-    }
-    auto dataval = obj->Get(ctx, dataStr).ToLocalChecked();
-    if (node::Buffer::HasInstance(dataval)) {
-        const size_t len = node::Buffer::Length(dataval);
-        const char* ptr = node::Buffer::Data(dataval);
-        prop.data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
-    } else {
-        // assume Utf8String
-        v8::String::Utf8Value str(dataval);
-        prop.data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
-    }
-    // if type is ATOM then try to internalize the data string
-    if (prop.type == XCB_ATOM_ATOM) {
-        xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, prop.data.size(), reinterpret_cast<char*>(&prop.data[0]));
-        xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
-        xcb_atom_t atom = XCB_ATOM_NONE;
-        if (reply) {
-            atom = reply->atom;
-            free(reply);
-        }
-        prop.data.resize(sizeof(xcb_atom_t));
-        memcpy(&prop.data[0], &atom, sizeof(xcb_atom_t));
-    }
-    return true;
 }
 
 static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::Value>& val)
@@ -363,21 +411,16 @@ static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::
         Nan::ThrowError("Class needs to be a string");
         return;
     }
-    if (!val->IsObject()) {
-        Nan::ThrowError("Data needs to be an object");
-        return;
-    }
     Nan::HandleScope scope;
     data.ensure();
 
     const std::string clsstr = *v8::String::Utf8Value(cls);
-    v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
 
-    Data::Property prop;
-    if (!Data::propertyFromObject(obj, prop))
+    std::shared_ptr<Data::Base> base;
+    if (!Data::baseFromValue(val, &base))
         return;
     // if we have an existing window, handle that here
-    data.classProperties[split(clsstr, '.')] = std::move(prop);
+    data.classProperties[split(clsstr, '.')] = base;
 
     GrabServer grab(data.conn);
     Traverser traverser;
