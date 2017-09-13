@@ -4,6 +4,47 @@
 #include <xcb/xcb_icccm.h>
 #include <unordered_map>
 #include <string>
+#include <sstream>
+#include <vector>
+#include <assert.h>
+
+template<typename Out>
+inline void split(const std::string &s, char delim, Out result)
+{
+    std::stringstream ss;
+    ss.str(s);
+    std::string item;
+    while (std::getline(ss, item, delim)) {
+        *(result++) = item;
+    }
+}
+
+
+inline std::vector<std::string> split(const std::string &s, char delim)
+{
+    std::vector<std::string> elems;
+    split(s, delim, std::back_inserter(elems));
+    return elems;
+}
+
+namespace std {
+template<>
+struct hash<std::vector<std::string> >
+{
+    std::size_t operator()(const std::vector<std::string>& vec) const
+    {
+        std::size_t hash = 5381;
+        int c;
+
+        for (const std::string& stdstr : vec) {
+            const char* str = stdstr.c_str();
+            while ((c = *str++))
+                hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
+        }
+        return hash;
+    }
+};
+} // namespace std
 
 struct Data
 {
@@ -12,6 +53,8 @@ struct Data
     void ensure();
     template<typename T>
     void forEachScreen(T cb);
+    template<typename T>
+    void forEachWindow(xcb_window_t parent, T cb);
 
     xcb_connection_t* conn;
     int screenCount;
@@ -25,18 +68,134 @@ struct Data
         std::string data;
     };
     static bool propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop);
-    std::unordered_map<std::string, Property> classProperties, nameProperties;
+    std::unordered_map<std::vector<std::string>, Property> classProperties;
 
     static void pollCallback(uv_poll_t* handle, int status, int events);
 } data;
 
+class Traverser
+{
+public:
+    Traverser();
+    ~Traverser() {}
+
+    void traverse(xcb_window_t win);
+
+    bool hasMore() const { return !mCookies.empty(); }
+    void run();
+
+private:
+    std::unordered_map<xcb_window_t, xcb_get_property_cookie_t> mCookies;
+    std::vector<std::vector<std::string> > mMatches;
+    uint32_t mLevel;
+};
+
+inline Traverser::Traverser()
+    : mLevel(0)
+{
+    // match everything by default
+    for (const auto &cls : data.classProperties) {
+        mMatches.push_back(cls.first);
+    }
+}
+
+void Traverser::traverse(xcb_window_t win)
+{
+    auto cookie = xcb_icccm_get_wm_class(data.conn, win);
+    mCookies[win] = cookie;
+}
+
+void Traverser::run()
+{
+    std::unordered_map<xcb_window_t, xcb_get_property_cookie_t> newCookies;
+
+    std::vector<uint32_t> hasmatch;
+    xcb_icccm_get_wm_class_reply_t wmclass;
+    for (const auto& cookie : mCookies) {
+        if (xcb_icccm_get_wm_class_reply(data.conn, cookie.second, &wmclass, nullptr)) {
+            // check if we match any of the items in the level
+            auto begin = mMatches.begin();
+            auto it = mMatches.begin();
+            while (it != mMatches.end()) {
+                if (it->size() > mLevel && (*it)[mLevel] == wmclass.class_name) {
+                    hasmatch.push_back(it - begin);
+                    // if we've matched everything, query children
+                    if (it->size() == mLevel + 1) {
+                        printf("matched full thingy\n");
+                    } else {
+                        // start the next property run
+                        data.forEachWindow(cookie.first, [&newCookies](xcb_connection_t* conn, xcb_window_t win) {
+                                auto cookie = xcb_icccm_get_wm_class(conn, win);
+                                newCookies[win] = cookie;
+                            });
+                    }
+                } else {
+                    printf("didn't match %s(%u)\n", wmclass.class_name, mLevel);
+                }
+                ++it;
+            }
+            xcb_icccm_get_wm_class_reply_wipe(&wmclass);
+        }
+    }
+    // take out all non-matches
+    auto begin = mMatches.begin();
+    uint32_t where = mMatches.size();
+    for (int32_t i = static_cast<int32_t>(hasmatch.size()) - 1; i >= 0; --i) {
+        uint32_t cnt = where - hasmatch[i];
+        if (cnt > 0) {
+            mMatches.erase(begin + where - cnt, begin + where);
+        }
+        where = hasmatch[i];
+    }
+
+    ++mLevel;
+    std::swap(mCookies, newCookies);
+}
+
+class GrabServer
+{
+public:
+    GrabServer(xcb_connection_t* conn)
+        : mConn(conn)
+    {
+        xcb_grab_server(mConn);
+    }
+    ~GrabServer()
+    {
+        xcb_ungrab_server(mConn);
+        xcb_flush(mConn);
+    }
+
+private:
+    xcb_connection_t* mConn;
+};
+
 template<typename T>
-void Data::forEachScreen(T cb)
+inline void Data::forEachScreen(T cb)
 {
     xcb_screen_iterator_t screen_iter = xcb_setup_roots_iterator(xcb_get_setup(conn));
     for (; screen_iter.rem != 0; xcb_screen_next(&screen_iter)) {
         cb(conn, screen_iter.data);
     }
+}
+
+template<typename T>
+inline void Data::forEachWindow(xcb_window_t parent, T cb)
+{
+    xcb_query_tree_cookie_t cookie = xcb_query_tree(conn, parent);
+    xcb_query_tree_reply_t* reply = xcb_query_tree_reply(conn, cookie, nullptr);
+    if (!reply)
+        return;
+    const int num = xcb_query_tree_children_length(reply);
+    if (!num) {
+        free(reply);
+        return;
+    }
+    xcb_window_t* children = xcb_query_tree_children(reply);
+    for (int i = 0; i < num; ++i) {
+        cb(conn, children[i]);
+    }
+    free(reply);
 }
 
 void Data::ensure()
@@ -65,6 +224,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     xcb_generic_event_t* event;
     while ((event = xcb_poll_for_event(data->conn))) {
         //printf("got event %d\n", event->response_type & ~0x80);
+        /*
         if ((event->response_type & ~0x80) == XCB_MAP_NOTIFY) {
             // window mapped
             xcb_map_notify_event_t* mapEvent = reinterpret_cast<xcb_map_notify_event_t*>(event);
@@ -72,18 +232,28 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
 
             auto cookie = xcb_icccm_get_wm_class(data->conn, mapEvent->window);
             xcb_icccm_get_wm_class_reply_t wmclass;
-            xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr);
-            printf("class is %s\n", wmclass.class_name);
-            xcb_icccm_get_wm_class_reply_wipe(&wmclass);
-        } else if ((event->response_type & ~0x80) == XCB_REPARENT_NOTIFY) {
+            if (xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr)) {
+                printf("class is %s\n", wmclass.class_name);
+                xcb_icccm_get_wm_class_reply_wipe(&wmclass);
+            }
+        } else */
+        if ((event->response_type & ~0x80) == XCB_REPARENT_NOTIFY) {
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
-            printf("reparented window %d\n", reparentEvent->window);
+            Traverser traverser;
+            traverser.traverse(reparentEvent->window);
+            while (traverser.hasMore()) {
+                traverser.run();
+            }
 
-            auto cookie = xcb_icccm_get_wm_class(data->conn, reparentEvent->window);
-            xcb_icccm_get_wm_class_reply_t wmclass;
-            xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr);
-            printf("class is %s\n", wmclass.class_name);
-            xcb_icccm_get_wm_class_reply_wipe(&wmclass);
+
+            // printf("reparented window %d\n", reparentEvent->window);
+
+            // auto cookie = xcb_icccm_get_wm_class(data->conn, reparentEvent->window);
+            // xcb_icccm_get_wm_class_reply_t wmclass;
+            // if (xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr)) {
+            //     printf("class is %s\n", wmclass.class_name);
+            //     xcb_icccm_get_wm_class_reply_wipe(&wmclass);
+            // }
         }
         // switch (event->response_type & ~0x80) {
         // }
@@ -191,31 +361,18 @@ static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::
     if (!Data::propertyFromObject(obj, prop))
         return;
     // if we have an existing window, handle that here
-    data.classProperties[clsstr] = std::move(prop);
-}
+    data.classProperties[split(clsstr, '.')] = std::move(prop);
 
-static void ForWindowName(const v8::Local<v8::Value>& name, const v8::Local<v8::Value>& val)
-{
-    if (!name->IsString()) {
-        Nan::ThrowError("Name needs to be a string");
-        return;
+    GrabServer grab(data.conn);
+    Traverser traverser;
+    data.forEachScreen([&traverser](xcb_connection_t*, xcb_screen_t* screen) {
+            data.forEachWindow(screen->root, [&traverser](xcb_connection_t*, xcb_window_t win) {
+                    traverser.traverse(win);
+                });
+        });
+    while (traverser.hasMore()) {
+        traverser.run();
     }
-    if (!val->IsObject()) {
-        Nan::ThrowError("Data needs to be an object");
-        return;
-    }
-
-    Nan::HandleScope scope;
-    data.ensure();
-
-    const std::string namestr = *v8::String::Utf8Value(name);
-    v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
-
-    Data::Property prop;
-    if (!Data::propertyFromObject(obj, prop))
-        return;
-    // if we have an existing window, handle that here
-    data.nameProperties[namestr] = std::move(prop);
 }
 
 static void ForWindow(const Nan::FunctionCallbackInfo<v8::Value>& args)
@@ -228,21 +385,13 @@ static void ForWindow(const Nan::FunctionCallbackInfo<v8::Value>& args)
     v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(args[0]);
 
     auto classStr = Nan::New("class").ToLocalChecked();
-    auto nameStr = Nan::New("name").ToLocalChecked();
     auto dataStr = Nan::New("data").ToLocalChecked();
-    if (!obj->Has(dataStr)) {
-        Nan::ThrowError("Needs a data property");
+    if (!obj->Has(dataStr) || !obj->Has(classStr)) {
+        Nan::ThrowError("Needs a class and data property");
         return;
     }
-    // if we have a class key
-    if (obj->Has(classStr)) {
-        ForWindowClass(obj->Get(Nan::GetCurrentContext(), classStr).ToLocalChecked(),
-                       obj->Get(Nan::GetCurrentContext(), dataStr).ToLocalChecked());
-    }
-    if (obj->Has(nameStr)) {
-        ForWindowName(obj->Get(Nan::GetCurrentContext(), nameStr).ToLocalChecked(),
-                      obj->Get(Nan::GetCurrentContext(), dataStr).ToLocalChecked());
-    }
+    ForWindowClass(obj->Get(Nan::GetCurrentContext(), classStr).ToLocalChecked(),
+                   obj->Get(Nan::GetCurrentContext(), dataStr).ToLocalChecked());
 }
 
 static v8::Local<v8::Object> getAtoms()
