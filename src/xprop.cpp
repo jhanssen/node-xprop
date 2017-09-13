@@ -9,6 +9,24 @@
 #include <memory>
 #include <assert.h>
 
+class GrabServer
+{
+public:
+    GrabServer(xcb_connection_t* conn)
+        : mConn(conn)
+    {
+        xcb_grab_server(mConn);
+    }
+    ~GrabServer()
+    {
+        xcb_ungrab_server(mConn);
+        xcb_flush(mConn);
+    }
+
+private:
+    xcb_connection_t* mConn;
+};
+
 template<typename Out>
 inline void split(const std::string &s, char delim, Out result)
 {
@@ -77,7 +95,22 @@ struct Data
         std::vector<uint8_t> data;
     };
 
+    struct Mapper : public Base
+    {
+        virtual void run(xcb_window_t win) const override;
+    };
+
+    struct Unmapper : public Base
+    {
+        virtual void run(xcb_window_t win) const override;
+    };
+
     struct Remapper : public Base
+    {
+        virtual void run(xcb_window_t win) const override;
+    };
+
+    struct PropertyClearer : public Base
     {
         virtual void run(xcb_window_t win) const override;
     };
@@ -93,12 +126,43 @@ void Data::Property::run(xcb_window_t win) const
     xcb_change_property(::data.conn, mode, win, property, type, format, (data.size() * 8) / format, &data[0]);
 }
 
+void Data::Mapper::run(xcb_window_t win) const
+{
+    xcb_map_window(data.conn, win);
+    xcb_flush(data.conn);
+}
+
+void Data::Unmapper::run(xcb_window_t win) const
+{
+    xcb_unmap_window(data.conn, win);
+    xcb_flush(data.conn);
+}
+
 void Data::Remapper::run(xcb_window_t win) const
 {
     xcb_unmap_window(data.conn, win);
     xcb_flush(data.conn);
     xcb_map_window(data.conn, win);
     xcb_flush(data.conn);
+}
+
+void Data::PropertyClearer::run(xcb_window_t win) const
+{
+    GrabServer grab(data.conn);
+    xcb_list_properties_cookie_t listCookie = xcb_list_properties(data.conn, win);
+    xcb_list_properties_reply_t* listReply = xcb_list_properties_reply(data.conn, listCookie, nullptr);
+    if (!listReply)
+        return;
+    const int num = xcb_list_properties_atoms_length(listReply);
+    xcb_atom_t* first = xcb_list_properties_atoms(listReply);
+    if (first && num > 0) {
+        const auto last = first + num;
+        for (xcb_atom_t* atom = first; atom != last; ++atom) {
+            xcb_delete_property(data.conn, win, *atom);
+        }
+    }
+
+    free(listReply);
 }
 
 class Changer
@@ -209,24 +273,6 @@ void Traverser::run()
     std::swap(mCookies, newCookies);
     // printf("got %lu children for level %d\n", mCookies.size(), mLevel);
 }
-
-class GrabServer
-{
-public:
-    GrabServer(xcb_connection_t* conn)
-        : mConn(conn)
-    {
-        xcb_grab_server(mConn);
-    }
-    ~GrabServer()
-    {
-        xcb_ungrab_server(mConn);
-        xcb_flush(mConn);
-    }
-
-private:
-    xcb_connection_t* mConn;
-};
 
 template<typename T>
 inline void Data::forEachScreen(T cb)
@@ -393,6 +439,18 @@ bool Data::baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>*
     } else if (val->IsString()) {
         // runner
         v8::String::Utf8Value str(val);
+        if (!strncmp(*str, "map", str.length())) {
+            *base = std::make_shared<Mapper>();
+            return true;
+        }
+        if (!strncmp(*str, "unmap", str.length())) {
+            *base = std::make_shared<Unmapper>();
+            return true;
+        }
+        if (!strncmp(*str, "clear", str.length())) {
+            *base = std::make_shared<PropertyClearer>();
+            return true;
+        }
         if (!strncmp(*str, "remap", str.length())) {
             *base = std::make_shared<Remapper>();
             return true;
