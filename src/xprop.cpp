@@ -332,15 +332,27 @@ bool Data::propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop)
     } else {
         prop.format = 8;
     }
-    auto data = obj->Get(ctx, dataStr).ToLocalChecked();
-    if (node::Buffer::HasInstance(data)) {
-        const size_t len = node::Buffer::Length(data);
-        const char* ptr = node::Buffer::Data(data);
+    auto dataval = obj->Get(ctx, dataStr).ToLocalChecked();
+    if (node::Buffer::HasInstance(dataval)) {
+        const size_t len = node::Buffer::Length(dataval);
+        const char* ptr = node::Buffer::Data(dataval);
         prop.data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
     } else {
         // assume Utf8String
-        v8::String::Utf8Value str(data);
+        v8::String::Utf8Value str(dataval);
         prop.data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
+    }
+    // if type is ATOM then try to internalize the data string
+    if (prop.type == XCB_ATOM_ATOM) {
+        xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, prop.data.size(), reinterpret_cast<char*>(&prop.data[0]));
+        xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
+        xcb_atom_t atom = XCB_ATOM_NONE;
+        if (reply) {
+            atom = reply->atom;
+            free(reply);
+        }
+        prop.data.resize(sizeof(xcb_atom_t));
+        memcpy(&prop.data[0], &atom, sizeof(xcb_atom_t));
     }
     return true;
 }
