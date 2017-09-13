@@ -113,16 +113,20 @@ void Traverser::run()
     xcb_icccm_get_wm_class_reply_t wmclass;
     for (const auto& cookie : mCookies) {
         if (xcb_icccm_get_wm_class_reply(data.conn, cookie.second, &wmclass, nullptr)) {
+            // printf("matching %s(%u) vs %zu candidates\n", wmclass.class_name, mLevel, mMatches.size());
             // check if we match any of the items in the level
             auto begin = mMatches.begin();
             auto it = mMatches.begin();
             while (it != mMatches.end()) {
                 if (it->size() > mLevel && (*it)[mLevel] == wmclass.class_name) {
-                    hasmatch.push_back(it - begin);
+                    if (std::find(hasmatch.begin(), hasmatch.end(), it - begin) == hasmatch.end()) {
+                        hasmatch.push_back(it - begin);
+                    }
                     // if we've matched everything, query children
                     if (it->size() == mLevel + 1) {
                         printf("matched full thingy\n");
                     } else {
+                        // printf("matched sub, querying children\n");
                         // start the next property run
                         data.forEachWindow(cookie.first, [&newCookies](xcb_connection_t* conn, xcb_window_t win) {
                                 auto cookie = xcb_icccm_get_wm_class(conn, win);
@@ -137,12 +141,16 @@ void Traverser::run()
             xcb_icccm_get_wm_class_reply_wipe(&wmclass);
         }
     }
+    std::sort(hasmatch.begin(), hasmatch.end());
     // take out all non-matches
+    // printf("%u matches\n", mMatches.size());
     auto begin = mMatches.begin();
     uint32_t where = mMatches.size();
     for (int32_t i = static_cast<int32_t>(hasmatch.size()) - 1; i >= 0; --i) {
-        uint32_t cnt = where - hasmatch[i];
+        uint32_t cnt = where - (hasmatch[i] + 1);
+        // printf("iter %d where %u, hadmatch %u cnt %u\n", i, where, hasmatch[i], cnt);
         if (cnt > 0) {
+            // printf("erasing from %u to %u (%u)\n", where - cnt, where, cnt);
             mMatches.erase(begin + where - cnt, begin + where);
         }
         where = hasmatch[i];
@@ -150,6 +158,7 @@ void Traverser::run()
 
     ++mLevel;
     std::swap(mCookies, newCookies);
+    // printf("got %lu children for level %d\n", mCookies.size(), mLevel);
 }
 
 class GrabServer
@@ -240,7 +249,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
         if ((event->response_type & ~0x80) == XCB_REPARENT_NOTIFY) {
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
             Traverser traverser;
-            traverser.traverse(reparentEvent->window);
+            traverser.traverse(reparentEvent->parent);
             while (traverser.hasMore()) {
                 traverser.run();
             }
