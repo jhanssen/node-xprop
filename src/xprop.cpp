@@ -253,20 +253,6 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     Data* data = static_cast<Data*>(handle->data);
     xcb_generic_event_t* event;
     while ((event = xcb_poll_for_event(data->conn))) {
-        //printf("got event %d\n", event->response_type & ~0x80);
-        /*
-        if ((event->response_type & ~0x80) == XCB_MAP_NOTIFY) {
-            // window mapped
-            xcb_map_notify_event_t* mapEvent = reinterpret_cast<xcb_map_notify_event_t*>(event);
-            printf("mapped window %d\n", mapEvent->window);
-
-            auto cookie = xcb_icccm_get_wm_class(data->conn, mapEvent->window);
-            xcb_icccm_get_wm_class_reply_t wmclass;
-            if (xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr)) {
-                printf("class is %s\n", wmclass.class_name);
-                xcb_icccm_get_wm_class_reply_wipe(&wmclass);
-            }
-        } else */
         if ((event->response_type & ~0x80) == XCB_REPARENT_NOTIFY) {
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
             Traverser traverser;
@@ -274,19 +260,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
             while (traverser.hasMore()) {
                 traverser.run();
             }
-
-
-            // printf("reparented window %d\n", reparentEvent->window);
-
-            // auto cookie = xcb_icccm_get_wm_class(data->conn, reparentEvent->window);
-            // xcb_icccm_get_wm_class_reply_t wmclass;
-            // if (xcb_icccm_get_wm_class_reply(data->conn, cookie, &wmclass, nullptr)) {
-            //     printf("class is %s\n", wmclass.class_name);
-            //     xcb_icccm_get_wm_class_reply_wipe(&wmclass);
-            // }
         }
-        // switch (event->response_type & ~0x80) {
-        // }
         free(event);
     }
 }
