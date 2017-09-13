@@ -65,13 +65,28 @@ struct Data
         uint8_t mode;
         xcb_atom_t property, type;
         uint8_t format;
-        std::string data;
+        std::vector<uint8_t> data;
     };
     static bool propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop);
     std::unordered_map<std::vector<std::string>, Property> classProperties;
 
     static void pollCallback(uv_poll_t* handle, int status, int events);
 } data;
+
+class Changer
+{
+public:
+    Changer() {}
+    ~Changer() {}
+
+    void change(xcb_window_t win, const Data::Property& prop);
+    void finish() { xcb_flush(data.conn); }
+};
+
+void Changer::change(xcb_window_t win, const Data::Property& prop)
+{
+    xcb_change_property(data.conn, prop.mode, win, prop.property, prop.type, prop.format, prop.data.size(), &prop.data[0]);
+}
 
 class Traverser
 {
@@ -108,6 +123,7 @@ void Traverser::traverse(xcb_window_t win)
 void Traverser::run()
 {
     std::unordered_map<xcb_window_t, xcb_get_property_cookie_t> newCookies;
+    Changer changer;
 
     std::vector<uint32_t> hasmatch;
     xcb_icccm_get_wm_class_reply_t wmclass;
@@ -125,6 +141,9 @@ void Traverser::run()
                     // if we've matched everything, query children
                     if (it->size() == mLevel + 1) {
                         printf("matched full thingy\n");
+                        auto prop = data.classProperties.find(*it);
+                        assert(prop != data.classProperties.end());
+                        changer.change(cookie.first, prop->second);
                     } else {
                         // printf("matched sub, querying children\n");
                         // start the next property run
@@ -141,6 +160,8 @@ void Traverser::run()
             xcb_icccm_get_wm_class_reply_wipe(&wmclass);
         }
     }
+    changer.finish();
+
     std::sort(hasmatch.begin(), hasmatch.end());
     // take out all non-matches
     // printf("%u matches\n", mMatches.size());
@@ -341,11 +362,11 @@ bool Data::propertyFromObject(const v8::Local<v8::Object>& obj, Property& prop)
     if (node::Buffer::HasInstance(data)) {
         const size_t len = node::Buffer::Length(data);
         const char* ptr = node::Buffer::Data(data);
-        prop.data = std::string(ptr, len);
+        prop.data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
     } else {
         // assume Utf8String
         v8::String::Utf8Value str(data);
-        prop.data = std::string(*str, str.length());
+        prop.data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
     }
     return true;
 }
