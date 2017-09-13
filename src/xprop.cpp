@@ -85,7 +85,7 @@ public:
 
 void Changer::change(xcb_window_t win, const Data::Property& prop)
 {
-    xcb_change_property(data.conn, prop.mode, win, prop.property, prop.type, prop.format, prop.data.size(), &prop.data[0]);
+    xcb_change_property(data.conn, prop.mode, win, prop.property, prop.type, prop.format, (prop.data.size() * 8) / prop.format, &prop.data[0]);
 }
 
 class Traverser
