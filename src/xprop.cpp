@@ -64,7 +64,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     Data* data = static_cast<Data*>(handle->data);
     xcb_generic_event_t* event;
     while ((event = xcb_poll_for_event(data->conn))) {
-        printf("got event %d\n", event->response_type & ~0x80);
+        //printf("got event %d\n", event->response_type & ~0x80);
         if ((event->response_type & ~0x80) == XCB_MAP_NOTIFY) {
             // window mapped
             xcb_map_notify_event_t* mapEvent = reinterpret_cast<xcb_map_notify_event_t*>(event);
