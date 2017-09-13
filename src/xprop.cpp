@@ -79,6 +79,8 @@ struct Data
     int screenCount;
     uv_poll_t poller;
 
+    xcb_atom_t atom_wm_state;
+
     struct Base
     {
         virtual ~Base() { }
@@ -158,7 +160,16 @@ void Data::PropertyClearer::run(xcb_window_t win) const
     if (first && num > 0) {
         const auto last = first + num;
         for (xcb_atom_t* atom = first; atom != last; ++atom) {
-            xcb_delete_property(data.conn, win, *atom);
+            switch (*atom) {
+            case XCB_ATOM_WM_CLASS:
+            case XCB_ATOM_WM_NAME:
+                break;
+            default:
+                if (*atom != data.atom_wm_state) {
+                    xcb_delete_property(data.conn, win, *atom);
+                }
+                break;
+            }
         }
     }
 
@@ -315,6 +326,15 @@ void Data::ensure()
             xcb_change_window_attributes_checked(conn, root, mask, values);
             xcb_flush(conn);
         });
+
+    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(conn, 0, 8, "WM_STATE");
+    xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(conn, cookie, nullptr);
+    atom_wm_state = XCB_ATOM_NONE;
+    if (reply) {
+        atom_wm_state = reply->atom;
+        free(reply);
+    }
+
     int fd = xcb_get_file_descriptor(conn);
     poller.data = &data;
     uv_poll_init(uv_default_loop(), &poller, fd);
