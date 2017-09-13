@@ -140,7 +140,7 @@ void Traverser::run()
                     }
                     // if we've matched everything, query children
                     if (it->size() == mLevel + 1) {
-                        printf("matched full thingy\n");
+                        // printf("matched full thingy\n");
                         auto prop = data.classProperties.find(*it);
                         assert(prop != data.classProperties.end());
                         changer.change(cookie.first, prop->second);
@@ -152,8 +152,8 @@ void Traverser::run()
                                 newCookies[win] = cookie;
                             });
                     }
-                } else {
-                    printf("didn't match %s(%u)\n", wmclass.class_name, mLevel);
+                // } else {
+                //     printf("didn't match %s(%u)\n", wmclass.class_name, mLevel);
                 }
                 ++it;
             }
@@ -235,7 +235,7 @@ void Data::ensure()
     conn = xcb_connect(NULL, &screenCount);
     data.forEachScreen([](xcb_connection_t* conn, xcb_screen_t* screen) {
             xcb_window_t root = screen->root;
-            printf("setting up on root %d\n", screen->root);
+            // printf("setting up on root %d\n", screen->root);
             uint32_t mask = XCB_CW_EVENT_MASK;
             uint32_t values[2] = { XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY, 0 };
             xcb_change_window_attributes_checked(conn, root, mask, values);
@@ -245,7 +245,7 @@ void Data::ensure()
     poller.data = &data;
     uv_poll_init(uv_default_loop(), &poller, fd);
     uv_poll_start(&poller, UV_READABLE, Data::pollCallback);
-    printf("setup xcb listener\n");
+    // printf("setup xcb listener\n");
 }
 
 void Data::pollCallback(uv_poll_t* handle, int status, int events)
