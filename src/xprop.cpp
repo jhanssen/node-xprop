@@ -445,6 +445,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
             change(XCB_UNMAP_NOTIFY, unmapEvent->window);
         } else if (eventType == XCB_REPARENT_NOTIFY) {
             // reparent might mean unmap?
+#warning maybe check what our parent is. if we are being reparented into a window manager frame then this is probably a map instead of an unmap
 
             // see if we have any pending changes for our window
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
