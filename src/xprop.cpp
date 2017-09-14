@@ -119,6 +119,18 @@ struct Data
         virtual void run(xcb_window_t win) const override;
     };
 
+    struct Configurer : public Base
+    {
+        Configurer(uint32_t xv, uint32_t yv, uint32_t widthv, uint32_t heightv)
+            : x(xv), y(yv), width(widthv), height(heightv)
+        {
+        }
+
+        uint32_t x, y, width, height;
+
+        virtual void run(xcb_window_t win) const override;
+    };
+
     struct Pending
     {
         xcb_window_t window;
@@ -161,6 +173,17 @@ void Data::Remapper::run(xcb_window_t win) const
     xcb_unmap_window(data.conn, win);
     xcb_flush(data.conn);
     xcb_map_window(data.conn, win);
+    xcb_flush(data.conn);
+}
+
+void Data::Configurer::run(xcb_window_t win) const
+{
+    uint32_t values[4] = { x, y, width, height };
+    xcb_configure_window(data.conn, win, XCB_CONFIG_WINDOW_X
+                         | XCB_CONFIG_WINDOW_Y
+                         | XCB_CONFIG_WINDOW_WIDTH
+                         | XCB_CONFIG_WINDOW_HEIGHT,
+                         values);
     xcb_flush(data.conn);
 }
 
@@ -480,100 +503,134 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
 bool Data::baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>* base)
 {
     if (val->IsObject()) {
-        // property?
-        v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
-
-        std::shared_ptr<Property> prop = std::make_shared<Property>();
-
         Nan::HandleScope scope;
         auto ctx = Nan::GetCurrentContext();
 
-        auto atom = [](const v8::Local<v8::Value>& val) -> xcb_atom_t {
-            if (val->IsNumber()) {
-                return v8::Local<v8::Int32>::Cast(val)->Value();
+        v8::Local<v8::Object> obj = v8::Local<v8::Object>::Cast(val);
+
+        auto whatStr = Nan::New("what").ToLocalChecked();
+        if (!obj->Has(whatStr)) {
+            Nan::ThrowError("Needs a what");
+            return false;
+        }
+
+        const std::string what = std::string(*v8::String::Utf8Value(obj->Get(ctx, whatStr).ToLocalChecked()));
+        if (what == "property") {
+            // property?
+
+            std::shared_ptr<Property> prop = std::make_shared<Property>();
+
+            auto atom = [](const v8::Local<v8::Value>& val) -> xcb_atom_t {
+                if (val->IsNumber()) {
+                    return v8::Local<v8::Int32>::Cast(val)->Value();
+                } else {
+                    v8::String::Utf8Value str(val);
+                    xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, str.length(), *str);
+                    xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
+                    xcb_atom_t atom = XCB_ATOM_NONE;
+                    if (reply) {
+                        atom = reply->atom;
+                        free(reply);
+                    }
+                    return atom;
+                }
+            };
+
+            auto modeStr = Nan::New("mode").ToLocalChecked();
+            auto propertyStr = Nan::New("property").ToLocalChecked();
+            auto typeStr = Nan::New("type").ToLocalChecked();
+            auto formatStr = Nan::New("format").ToLocalChecked();
+            auto dataStr = Nan::New("data").ToLocalChecked();
+
+            // required properties
+            if (!obj->Has(propertyStr) || !obj->Has(dataStr)) {
+                Nan::ThrowError("Needs at least property and data");
+                return false;
+            }
+
+            if (obj->Has(modeStr)) {
+                prop->mode = v8::Local<v8::Number>::Cast(obj->Get(ctx, modeStr).ToLocalChecked())->Value();
+                switch (prop->mode) {
+                case XCB_PROP_MODE_REPLACE:
+                case XCB_PROP_MODE_PREPEND:
+                case XCB_PROP_MODE_APPEND:
+                    break;
+                default:
+                    Nan::ThrowError("Invalid mode");
+                    return false;
+                }
             } else {
-                v8::String::Utf8Value str(val);
-                xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, str.length(), *str);
+                prop->mode = XCB_PROP_MODE_REPLACE;
+            }
+            prop->property = atom(obj->Get(ctx, propertyStr).ToLocalChecked());
+            if (obj->Has(typeStr)) {
+                prop->type = atom(obj->Get(ctx, typeStr).ToLocalChecked());
+            } else {
+                prop->type = XCB_ATOM_STRING;
+            }
+            if (obj->Has(formatStr)) {
+                prop->format = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
+                switch (prop->format) {
+                case 8:
+                case 16:
+                case 32:
+                    break;
+                default:
+                    Nan::ThrowError("Invalid format");
+                    return false;
+                }
+            } else {
+                prop->format = 8;
+            }
+            auto dataval = obj->Get(ctx, dataStr).ToLocalChecked();
+            if (node::Buffer::HasInstance(dataval)) {
+                const size_t len = node::Buffer::Length(dataval);
+                const char* ptr = node::Buffer::Data(dataval);
+                prop->data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
+            } else {
+                // assume Utf8String
+                v8::String::Utf8Value str(dataval);
+                prop->data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
+            }
+            // if type is ATOM then try to internalize the data string
+            if (prop->type == XCB_ATOM_ATOM) {
+                xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, prop->data.size(), reinterpret_cast<char*>(&prop->data[0]));
                 xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
                 xcb_atom_t atom = XCB_ATOM_NONE;
                 if (reply) {
                     atom = reply->atom;
                     free(reply);
                 }
-                return atom;
+                prop->data.resize(sizeof(xcb_atom_t));
+                memcpy(&prop->data[0], &atom, sizeof(xcb_atom_t));
             }
-        };
+            *base = prop;
+            return true;
+        } else if (what == "configure") {
+            auto xStr = Nan::New("x").ToLocalChecked();
+            auto yStr = Nan::New("y").ToLocalChecked();
+            auto widthStr = Nan::New("width").ToLocalChecked();
+            auto heightStr = Nan::New("height").ToLocalChecked();
 
-        auto modeStr = Nan::New("mode").ToLocalChecked();
-        auto propertyStr = Nan::New("property").ToLocalChecked();
-        auto typeStr = Nan::New("type").ToLocalChecked();
-        auto formatStr = Nan::New("format").ToLocalChecked();
-        auto dataStr = Nan::New("data").ToLocalChecked();
-
-        // required properties
-        if (!obj->Has(propertyStr) || !obj->Has(dataStr)) {
-            Nan::ThrowError("Needs at least property and data");
+            uint32_t x = 0, y = 0, w = 0, h = 0;
+            if (obj->Has(xStr)) {
+                x = v8::Local<v8::Uint32>::Cast(obj->Get(ctx, xStr).ToLocalChecked())->Value();
+            }
+            if (obj->Has(yStr)) {
+                y = v8::Local<v8::Uint32>::Cast(obj->Get(ctx, yStr).ToLocalChecked())->Value();
+            }
+            if (obj->Has(widthStr)) {
+                w = v8::Local<v8::Uint32>::Cast(obj->Get(ctx, widthStr).ToLocalChecked())->Value();
+            }
+            if (obj->Has(heightStr)) {
+                h = v8::Local<v8::Uint32>::Cast(obj->Get(ctx, heightStr).ToLocalChecked())->Value();
+            }
+            *base = std::make_shared<Configurer>(x, y, w, h);
+            return true;
+        } else {
+            Nan::ThrowError("Invalid what");
             return false;
         }
-
-        if (obj->Has(modeStr)) {
-            prop->mode = v8::Local<v8::Number>::Cast(obj->Get(ctx, modeStr).ToLocalChecked())->Value();
-            switch (prop->mode) {
-            case XCB_PROP_MODE_REPLACE:
-            case XCB_PROP_MODE_PREPEND:
-            case XCB_PROP_MODE_APPEND:
-                break;
-            default:
-                Nan::ThrowError("Invalid mode");
-                return false;
-            }
-        } else {
-            prop->mode = XCB_PROP_MODE_REPLACE;
-        }
-        prop->property = atom(obj->Get(ctx, propertyStr).ToLocalChecked());
-        if (obj->Has(typeStr)) {
-            prop->type = atom(obj->Get(ctx, typeStr).ToLocalChecked());
-        } else {
-            prop->type = XCB_ATOM_STRING;
-        }
-        if (obj->Has(formatStr)) {
-            prop->format = v8::Local<v8::Int32>::Cast(obj->Get(ctx, formatStr).ToLocalChecked())->Value();
-            switch (prop->format) {
-            case 8:
-            case 16:
-            case 32:
-                break;
-            default:
-                Nan::ThrowError("Invalid format");
-                return false;
-            }
-        } else {
-            prop->format = 8;
-        }
-        auto dataval = obj->Get(ctx, dataStr).ToLocalChecked();
-        if (node::Buffer::HasInstance(dataval)) {
-            const size_t len = node::Buffer::Length(dataval);
-            const char* ptr = node::Buffer::Data(dataval);
-            prop->data.assign(reinterpret_cast<const uint8_t*>(ptr), reinterpret_cast<const uint8_t*>(ptr) + len);
-        } else {
-            // assume Utf8String
-            v8::String::Utf8Value str(dataval);
-            prop->data.assign(reinterpret_cast<const uint8_t*>(*str), reinterpret_cast<const uint8_t*>(*str) + str.length());
-        }
-        // if type is ATOM then try to internalize the data string
-        if (prop->type == XCB_ATOM_ATOM) {
-            xcb_intern_atom_cookie_t cookie = xcb_intern_atom(data.conn, 0, prop->data.size(), reinterpret_cast<char*>(&prop->data[0]));
-            xcb_intern_atom_reply_t* reply = xcb_intern_atom_reply(data.conn, cookie, nullptr);
-            xcb_atom_t atom = XCB_ATOM_NONE;
-            if (reply) {
-                atom = reply->atom;
-                free(reply);
-            }
-            prop->data.resize(sizeof(xcb_atom_t));
-            memcpy(&prop->data[0], &atom, sizeof(xcb_atom_t));
-        }
-        *base = prop;
-        return true;
     } else if (val->IsString()) {
         // runner
         v8::String::Utf8Value str(val);
