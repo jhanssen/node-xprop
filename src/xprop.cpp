@@ -451,15 +451,7 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
             change(XCB_UNMAP_NOTIFY, reparentEvent->window);
         } else if (eventType == XCB_DESTROY_NOTIFY) {
             xcb_destroy_notify_event_t* destroyEvent = reinterpret_cast<xcb_destroy_notify_event_t*>(event);
-            xcb_window_t real = XCB_WINDOW_NONE;
-            data.forEachWindow(destroyEvent->window, [&real](xcb_connection_t*, xcb_window_t win) {
-                    if (real == XCB_WINDOW_NONE)
-                        real = win;
-                });
-            if (real == XCB_WINDOW_NONE)
-                real = destroyEvent->window;
-
-            data.seen.erase(real);
+            data.seen.erase(destroyEvent->window);
         }
         // printf("got event %d\n", eventType);
         free(event);
