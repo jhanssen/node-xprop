@@ -134,6 +134,7 @@ struct Data
 
 void Data::Property::run(xcb_window_t win) const
 {
+    // printf("prop change\n");
     xcb_change_property(::data.conn, mode, win, property, type, format, (data.size() * 8) / format, &data[0]);
 }
 
@@ -143,6 +144,7 @@ void Data::Mapper::run(xcb_window_t win) const
     data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_map_window(data.conn, win);
     xcb_flush(data.conn);
+    // printf("mapped\n");
 }
 
 void Data::Unmapper::run(xcb_window_t win) const
@@ -151,7 +153,7 @@ void Data::Unmapper::run(xcb_window_t win) const
     data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_unmap_window(data.conn, win);
     xcb_flush(data.conn);
-    // printf("unmapped %u\n", win);
+    // printf("unmapped %u %llu\n", win, key);
 }
 
 void Data::Remapper::run(xcb_window_t win) const
@@ -447,12 +449,15 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
             xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
             std::vector<uint64_t> keys;
             keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | reparentEvent->window);
+            // printf("reparent, will look for key %llu\n", keys.back());
             data->forEachWindow(reparentEvent->window, [&keys](xcb_connection_t*, xcb_window_t win) {
                     keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win);
+                    // printf("  reparent, will also look for key %llu\n", keys.back());
                 });
             Changer changer(1);
             for (size_t i = 0; i < data->pendingProperties.size(); ++i) {
                 const auto& p = data->pendingProperties[i];
+                // printf("about to look for key %llu\n", p.first);
                 if (std::find(keys.begin(), keys.end(), p.first) != keys.end()) {
                     for (const auto& item : p.second) {
                         changer.change(item.window, item.base);
@@ -611,12 +616,25 @@ static void ForWindowClass(const v8::Local<v8::Value>& cls, const v8::Local<v8::
         return;
     // if we have an existing window, handle that here
     data.classProperties[split(clsstr, '.')].push_back(base);
+}
 
+static void Start(const Nan::FunctionCallbackInfo<v8::Value>& args)
+{
     GrabServer grab(data.conn);
     Traverser traverser;
     data.forEachScreen([&traverser](xcb_connection_t*, xcb_screen_t* screen) {
             data.forEachWindow(screen->root, [&traverser](xcb_connection_t*, xcb_window_t win) {
-                    traverser.traverse(win);
+                    xcb_window_t real = XCB_WINDOW_NONE;
+                    data.forEachWindow(win, [&real](xcb_connection_t*, xcb_window_t win) {
+                            if (real == XCB_WINDOW_NONE)
+                                real = win;
+                        });
+                    if (real == XCB_WINDOW_NONE)
+                        real = win;
+                    if (data.seen.find(real) == data.seen.end()) {
+                        data.seen.insert(real);
+                        traverser.traverse(win);
+                    }
                 });
         });
     while (traverser.hasMore()) {
@@ -724,6 +742,8 @@ static void Initialize(v8::Local<v8::Object> exports)
 {
     exports->Set(Nan::New("forWindow").ToLocalChecked(),
                  Nan::New<v8::FunctionTemplate>(ForWindow)->GetFunction());
+    exports->Set(Nan::New("start").ToLocalChecked(),
+                 Nan::New<v8::FunctionTemplate>(Start)->GetFunction());
     exports->Set(Nan::New("atoms").ToLocalChecked(), getAtoms());
 }
 
