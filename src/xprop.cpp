@@ -179,6 +179,7 @@ void Data::PropertyClearer::run(xcb_window_t win) const
             switch (*atom) {
             case XCB_ATOM_WM_CLASS:
             case XCB_ATOM_WM_NAME:
+            case XCB_ATOM_WM_NORMAL_HINTS:
                 break;
             default:
                 if (*atom != data.atom_wm_state) {
