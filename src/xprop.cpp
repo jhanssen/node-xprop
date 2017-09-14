@@ -3,6 +3,7 @@
 #include <xcb/xcb.h>
 #include <xcb/xcb_icccm.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <sstream>
 #include <vector>
@@ -80,6 +81,7 @@ struct Data
     uv_poll_t poller;
 
     xcb_atom_t atom_wm_state;
+    std::unordered_set<xcb_window_t> seen;
 
     struct Base
     {
@@ -122,7 +124,7 @@ struct Data
         xcb_window_t window;
         std::shared_ptr<Base> base;
     };
-    std::vector<std::pair<uint32_t, std::vector<Pending> > > pendingProperties;
+    std::vector<std::pair<uint64_t, std::vector<Pending> > > pendingProperties;
 
     static bool baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>* base);
     std::unordered_map<std::vector<std::string>, std::vector<std::shared_ptr<Base> > > classProperties;
@@ -137,19 +139,19 @@ void Data::Property::run(xcb_window_t win) const
 
 void Data::Mapper::run(xcb_window_t win) const
 {
-    // const auto key = (static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | win;
-    // data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
+    const uint64_t key = (static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | win;
+    data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_map_window(data.conn, win);
     xcb_flush(data.conn);
 }
 
 void Data::Unmapper::run(xcb_window_t win) const
 {
-    // const auto key = (static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win;
-    // data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
+    const uint64_t key = (static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win;
+    data.pendingProperties.push_back(std::make_pair(key, std::vector<Pending>()));
     xcb_unmap_window(data.conn, win);
     xcb_flush(data.conn);
-    // printf("unmapped\n");
+    // printf("unmapped %u\n", win);
 }
 
 void Data::Remapper::run(xcb_window_t win) const
@@ -191,16 +193,19 @@ void Data::PropertyClearer::run(xcb_window_t win) const
 class Changer
 {
 public:
-    Changer() {}
+    Changer(size_t off = 0) : mOffset(off) {}
     ~Changer() {}
 
     void change(xcb_window_t win, const std::shared_ptr<Data::Base>& b);
     void finish() { xcb_flush(data.conn); }
+
+private:
+    size_t mOffset;
 };
 
 void Changer::change(xcb_window_t win, const std::shared_ptr<Data::Base>& b)
 {
-    if (data.pendingProperties.empty()) {
+    if (mOffset >= data.pendingProperties.size()) {
         // printf("changing...\n");
         b->run(win);
     } else {
@@ -369,55 +374,98 @@ void Data::pollCallback(uv_poll_t* handle, int status, int events)
     xcb_generic_event_t* event;
     while ((event = xcb_poll_for_event(data->conn))) {
         const auto eventType = event->response_type & ~0x80;
-        if (eventType == XCB_REPARENT_NOTIFY) {
-            // see if we have any pending changes for our window
-            xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
+        // if (eventType == XCB_REPARENT_NOTIFY) {
+        //     // see if we have any pending changes for our window
+        //     xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
 
-            Traverser traverser;
-            traverser.traverse(reparentEvent->parent);
-            while (traverser.hasMore()) {
-                traverser.run();
-            }
-        }
-        /*
+        //     Traverser traverser;
+        //     traverser.traverse(reparentEvent->parent);
+        //     while (traverser.hasMore()) {
+        //         traverser.run();
+        //     }
+        // }
+        
         if (eventType == XCB_MAP_NOTIFY) {
             // see if we have any pending changes for our window
             xcb_map_notify_event_t* mapEvent = reinterpret_cast<xcb_map_notify_event_t*>(event);
-            const auto key = (static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | mapEvent->window;
-            auto p = data->pendingProperties.begin();
-            while (p != data->pendingProperties.end()) {
-                if (p->first == key) {
-                    for (const auto& item : p->second) {
-                        item.base->run(item.window);
+            std::vector<uint64_t> keys;
+            xcb_window_t real = XCB_WINDOW_NONE;
+            keys.push_back((static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | mapEvent->window);
+            data->forEachWindow(mapEvent->window, [&keys, &real](xcb_connection_t*, xcb_window_t win) {
+                    keys.push_back((static_cast<uint64_t>(XCB_MAP_NOTIFY) << 32) | win);
+                    if (real == XCB_WINDOW_NONE)
+                        real = win;
+                });
+            if (real == XCB_WINDOW_NONE)
+                real = mapEvent->window;
+            Changer changer(1);
+            for (size_t i = 0; i < data->pendingProperties.size(); ++i) {
+                const auto& p = data->pendingProperties[i];
+                if (std::find(keys.begin(), keys.end(), p.first) != keys.end()) {
+                    for (const auto& item : p.second) {
+                        changer.change(item.window, item.base);
                     }
-                    p = data->pendingProperties.erase(p);
-                } else {
-                    ++p;
+                    data->pendingProperties.erase(data->pendingProperties.begin() + i);
+                    break;
                 }
             }
+            changer.finish();
 
-            Traverser traverser;
-            traverser.traverse(mapEvent->window);
-            while (traverser.hasMore()) {
-                traverser.run();
+            if (data->seen.find(real) == data->seen.end()) {
+                Traverser traverser;
+                traverser.traverse(mapEvent->window);
+                while (traverser.hasMore()) {
+                    traverser.run();
+                }
+                data->seen.insert(real);
             }
         } else if (eventType == XCB_UNMAP_NOTIFY) {
             // see if we have any pending changes for our window
             xcb_unmap_notify_event_t* unmapEvent = reinterpret_cast<xcb_unmap_notify_event_t*>(event);
-            const uint64_t key = (static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | unmapEvent->window;
-            auto p = data->pendingProperties.begin();
-            while (p != data->pendingProperties.end()) {
-                if (p->first == key) {
-                    for (const auto& item : p->second) {
-                        item.base->run(item.window);
+            // printf("really unmapped %u\n", unmapEvent->window);
+            std::vector<uint64_t> keys;
+            keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | unmapEvent->window);
+            data->forEachWindow(unmapEvent->window, [&keys](xcb_connection_t*, xcb_window_t win) {
+                    keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win);
+                });
+            Changer changer(1);
+            for (size_t i = 0; i < data->pendingProperties.size(); ++i) {
+                const auto& p = data->pendingProperties[i];
+                if (std::find(keys.begin(), keys.end(), p.first) != keys.end()) {
+                    for (const auto& item : p.second) {
+                        changer.change(item.window, item.base);
                     }
-                    p = data->pendingProperties.erase(p);
-                } else {
-                    ++p;
+                    data->pendingProperties.erase(data->pendingProperties.begin() + i);
+                    break;
                 }
             }
+            changer.finish();
+        } else if (eventType == XCB_REPARENT_NOTIFY) {
+            // reparent might mean unmap?
+
+            // see if we have any pending changes for our window
+            xcb_reparent_notify_event_t* reparentEvent = reinterpret_cast<xcb_reparent_notify_event_t*>(event);
+            std::vector<uint64_t> keys;
+            keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | reparentEvent->window);
+            data->forEachWindow(reparentEvent->window, [&keys](xcb_connection_t*, xcb_window_t win) {
+                    keys.push_back((static_cast<uint64_t>(XCB_UNMAP_NOTIFY) << 32) | win);
+                });
+            Changer changer(1);
+            for (size_t i = 0; i < data->pendingProperties.size(); ++i) {
+                const auto& p = data->pendingProperties[i];
+                if (std::find(keys.begin(), keys.end(), p.first) != keys.end()) {
+                    for (const auto& item : p.second) {
+                        changer.change(item.window, item.base);
+                    }
+                    data->pendingProperties.erase(data->pendingProperties.begin() + i);
+                    break;
+                }
             }
-        */
+            changer.finish();
+        } else if (eventType == XCB_DESTROY_NOTIFY) {
+            xcb_destroy_notify_event_t* destroyEvent = reinterpret_cast<xcb_destroy_notify_event_t*>(event);
+            data->seen.erase(destroyEvent->window);
+        }
         // printf("got event %d\n", eventType);
         free(event);
     }
