@@ -131,6 +131,15 @@ struct Data
         virtual void run(xcb_window_t win) const override;
     };
 
+    struct Overrider : public Base
+    {
+        Overrider(bool o) : on(o) { }
+
+        bool on;
+
+        virtual void run(xcb_window_t win) const override;
+    };
+
     struct Pending
     {
         xcb_window_t window;
@@ -184,6 +193,13 @@ void Data::Configurer::run(xcb_window_t win) const
                          | XCB_CONFIG_WINDOW_WIDTH
                          | XCB_CONFIG_WINDOW_HEIGHT,
                          values);
+    xcb_flush(data.conn);
+}
+
+void Data::Overrider::run(xcb_window_t win) const
+{
+    uint32_t value[] = { on ? 1u : 0u };
+    xcb_change_window_attributes(data.conn, win, XCB_CW_OVERRIDE_REDIRECT, value);
     xcb_flush(data.conn);
 }
 
@@ -474,7 +490,16 @@ bool Data::baseFromValue(const v8::Local<v8::Value>& val, std::shared_ptr<Base>*
         }
 
         const std::string what = std::string(*v8::String::Utf8Value(obj->Get(ctx, whatStr).ToLocalChecked()));
-        if (what == "property") {
+        if (what == "override_redirect") {
+            auto onStr = Nan::New("on").ToLocalChecked();
+            if (!obj->Has(onStr)) {
+                Nan::ThrowError("Needs at least on");
+                return false;
+            }
+            const bool on = v8::Local<v8::Boolean>::Cast(obj->Get(ctx, onStr).ToLocalChecked())->Value();
+            *base = std::make_shared<Overrider>(on);
+            return true;
+        } else if (what == "property") {
             // property?
 
             std::shared_ptr<Property> prop = std::make_shared<Property>();
